@@ -16,9 +16,7 @@ import {
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import type { BuiltinSubagentType, SubagentType, SubagentTypeConfig, CustomAgentConfig } from "./types.js";
 
-export type Tool = AgentTool<any>;
-
-type ToolFactory = (cwd: string) => Tool;
+type ToolFactory = (cwd: string) => AgentTool<any>;
 
 const TOOL_FACTORIES: Record<string, ToolFactory> = {
   read: (cwd) => createReadTool(cwd),
@@ -103,7 +101,7 @@ export function isValidType(type: string): boolean {
 }
 
 /** Get built-in tools for a type. Works for both built-in and custom agents. */
-export function getToolsForType(type: SubagentType, cwd: string): Tool[] {
+export function getToolsForType(type: SubagentType, cwd: string): AgentTool<any>[] {
   const config = BUILTIN_CONFIGS[type as BuiltinSubagentType];
   if (config) {
     return config.builtinToolNames.map((n) => TOOL_FACTORIES[n](cwd));

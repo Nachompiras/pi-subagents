@@ -7,13 +7,15 @@
 
 import type { AgentManager } from "../agent-manager.js";
 import type { SubagentType } from "../types.js";
-import { DISPLAY_NAMES } from "../types.js";
-import { getCustomAgentConfig } from "../agent-types.js";
+import { getConfig } from "../agent-types.js";
 
 // ---- Constants ----
 
 /** Braille spinner frames for animated running indicator. */
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
+export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
 
 /** Tool name → human-readable action for activity descriptions. */
 const TOOL_DISPLAY: Record<string, string> = {
@@ -94,9 +96,7 @@ export function formatDuration(startedAt: number, completedAt?: number): string 
 
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
-  if (type in DISPLAY_NAMES) return DISPLAY_NAMES[type as keyof typeof DISPLAY_NAMES];
-  const custom = getCustomAgentConfig(type);
-  return custom?.name ?? type;
+  return getConfig(type).displayName;
 }
 
 /** Truncate text to a single line, max `len` chars. */
@@ -178,8 +178,7 @@ export class AgentWidget {
   /** Check if a finished agent should still be shown in the widget. */
   private shouldShowFinished(agentId: string, status: string): boolean {
     const age = this.finishedTurnAge.get(agentId) ?? 0;
-    const isError = status === "error" || status === "aborted" || status === "steered" || status === "stopped";
-    const maxAge = isError ? AgentWidget.ERROR_LINGER_TURNS : 1;
+    const maxAge = ERROR_STATUSES.has(status) ? AgentWidget.ERROR_LINGER_TURNS : 1;
     return age < maxAge;
   }
 

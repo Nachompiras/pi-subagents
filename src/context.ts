@@ -5,7 +5,7 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 /** Extract text from a message content block array. */
-function extractText(content: unknown[]): string {
+export function extractText(content: unknown[]): string {
   return content
     .filter((c: any) => c.type === "text")
     .map((c: any) => c.text ?? "")

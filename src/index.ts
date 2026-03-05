@@ -39,6 +39,83 @@ function textResult(msg: string, details?: AgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details: details as any };
 }
 
+/** Safe token formatting — wraps session.getSessionStats() in try-catch. */
+function safeFormatTokens(session: { getSessionStats(): { tokens: { total: number } } } | undefined): string {
+  if (!session) return "";
+  try { return formatTokens(session.getSessionStats().tokens.total); } catch { return ""; }
+}
+
+/**
+ * Create an AgentActivity state and spawn callbacks for tracking tool usage.
+ * Used by both foreground and background paths to avoid duplication.
+ */
+function createActivityTracker(onStreamUpdate?: () => void) {
+  const state: AgentActivity = { activeTools: new Map(), toolUses: 0, tokens: "", responseText: "", session: undefined };
+
+  const callbacks = {
+    onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
+      if (activity.type === "start") {
+        state.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
+      } else {
+        for (const [key, name] of state.activeTools) {
+          if (name === activity.toolName) { state.activeTools.delete(key); break; }
+        }
+        state.toolUses++;
+      }
+      state.tokens = safeFormatTokens(state.session);
+      onStreamUpdate?.();
+    },
+    onTextDelta: (_delta: string, fullText: string) => {
+      state.responseText = fullText;
+      onStreamUpdate?.();
+    },
+    onSessionCreated: (session: any) => {
+      state.session = session;
+    },
+  };
+
+  return { state, callbacks };
+}
+
+/** Human-readable status label for agent completion. */
+function getStatusLabel(status: string, error?: string): string {
+  switch (status) {
+    case "error": return `Error: ${error ?? "unknown"}`;
+    case "aborted": return "Aborted (max turns exceeded)";
+    case "steered": return "Wrapped up (turn limit)";
+    case "stopped": return "Stopped";
+    default: return "Done";
+  }
+}
+
+/** Parenthetical status note for completed agent result text. */
+function getStatusNote(status: string): string {
+  switch (status) {
+    case "aborted": return " (aborted — max turns exceeded, output may be incomplete)";
+    case "steered": return " (wrapped up — reached turn limit)";
+    case "stopped": return " (stopped by user)";
+    default: return "";
+  }
+}
+
+/** Build AgentDetails from a base + record-specific fields. */
+function buildDetails(
+  base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any },
+  overrides?: Partial<AgentDetails>,
+): AgentDetails {
+  return {
+    ...base,
+    toolUses: record.toolUses,
+    tokens: safeFormatTokens(record.session),
+    durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
+    status: record.status as AgentDetails["status"],
+    agentId: record.id,
+    error: record.error,
+    ...overrides,
+  };
+}
+
 /** Resolve system prompt overrides from a custom agent config. */
 function resolveCustomPrompt(config: CustomAgentConfig | undefined): {
   systemPromptOverride?: string;
@@ -126,15 +203,7 @@ export default function (pi: ExtensionAPI) {
     const displayName = getDisplayName(record.type);
     const duration = formatDuration(record.startedAt, record.completedAt);
 
-    const status = record.status === "error"
-      ? `Error: ${record.error}`
-      : record.status === "aborted"
-        ? "Aborted (max turns exceeded)"
-        : record.status === "steered"
-          ? "Wrapped up (turn limit)"
-          : record.status === "stopped"
-            ? "Stopped"
-            : "Done";
+    const status = getStatusLabel(record.status, record.error);
 
     const resultPreview = record.result
       ? record.result.length > 500
@@ -414,21 +483,15 @@ Guidelines:
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
-        const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
-        let resumeTokens = "";
-        if (record.session) {
-          try { resumeTokens = formatTokens(record.session.getSessionStats().tokens.total); } catch { /* ignore */ }
-        }
         return textResult(
           record.result ?? record.error ?? "No output.",
-          { ...detailBase, toolUses: record.toolUses, tokens: resumeTokens, durationMs, status: record.status, agentId: record.id },
+          buildDetails(detailBase, record),
         );
       }
 
       // Background execution
       if (runInBackground) {
-        // Set up activity tracking for the widget
-        const bgState = { activeTools: new Map<string, string>(), toolUses: 0, tokens: "", responseText: "", session: undefined as any };
+        const { state: bgState, callbacks: bgCallbacks } = createActivityTracker();
 
         const id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
@@ -440,21 +503,7 @@ Guidelines:
           systemPromptOverride,
           systemPromptAppend,
           isBackground: true,
-          onToolActivity: (activity) => {
-            if (activity.type === "start") {
-              bgState.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
-            } else {
-              for (const [key, name] of bgState.activeTools) {
-                if (name === activity.toolName) { bgState.activeTools.delete(key); break; }
-              }
-              bgState.toolUses++;
-            }
-            if (bgState.session) {
-              try { bgState.tokens = formatTokens(bgState.session.getSessionStats().tokens.total); } catch { /* */ }
-            }
-          },
-          onTextDelta: (_delta, fullText) => { bgState.responseText = fullText; },
-          onSessionCreated: (session) => { bgState.session = session; },
+          ...bgCallbacks,
         });
 
         agentActivity.set(id, bgState);
@@ -476,32 +525,40 @@ Guidelines:
       }
 
       // Foreground (synchronous) execution — stream progress via onUpdate
-      let toolUses = 0;
-      let tokenText = "";
       let spinnerFrame = 0;
-      let agentSession: { getSessionStats(): { tokens: { total: number } } } | undefined;
       const startedAt = Date.now();
-      const activeTools = new Map<string, string>(); // key → toolName
-
-      // Register in shared activity map so the widget can show this agent
-      let fgResponseText = "";
-      const fgState = { activeTools, toolUses: 0, tokens: "", responseText: "", session: undefined as any };
       let fgId: string | undefined;
 
       const streamUpdate = () => {
         const details: AgentDetails = {
           ...detailBase,
-          toolUses,
-          tokens: tokenText,
+          toolUses: fgState.toolUses,
+          tokens: fgState.tokens,
           durationMs: Date.now() - startedAt,
           status: "running",
-          activity: describeActivity(activeTools, fgResponseText),
+          activity: describeActivity(fgState.activeTools, fgState.responseText),
           spinnerFrame: spinnerFrame % SPINNER.length,
         };
         onUpdate?.({
-          content: [{ type: "text", text: `${toolUses} tool uses...` }],
+          content: [{ type: "text", text: `${fgState.toolUses} tool uses...` }],
           details: details as any,
         });
+      };
+
+      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(streamUpdate);
+
+      // Wire session creation to register in widget
+      const origOnSession = fgCallbacks.onSessionCreated;
+      fgCallbacks.onSessionCreated = (session: any) => {
+        origOnSession(session);
+        for (const a of manager.listAgents()) {
+          if (a.session === session) {
+            fgId = a.id;
+            agentActivity.set(a.id, fgState);
+            widget.ensureTimer();
+            break;
+          }
+        }
       };
 
       // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
@@ -521,48 +578,7 @@ Guidelines:
         thinkingLevel: thinking,
         systemPromptOverride,
         systemPromptAppend,
-        onSessionCreated: (session) => {
-          agentSession = session;
-          fgState.session = session;
-          // Find our agent ID from the manager and register in widget
-          for (const a of manager.listAgents()) {
-            if (a.session === session) {
-              fgId = a.id;
-              agentActivity.set(a.id, fgState);
-              widget.ensureTimer();
-              break;
-            }
-          }
-        },
-        onToolActivity: (activity) => {
-          if (activity.type === "start") {
-            activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
-          } else {
-            // Remove one instance of this tool
-            for (const [key, name] of activeTools) {
-              if (name === activity.toolName) {
-                activeTools.delete(key);
-                break;
-              }
-            }
-            toolUses++;
-            fgState.toolUses = toolUses;
-          }
-          // Update token count from session (stored on record by onSessionCreated)
-          if (agentSession) {
-            try {
-              const stats = agentSession.getSessionStats();
-              tokenText = formatTokens(stats.tokens.total);
-              fgState.tokens = tokenText;
-            } catch { /* session may not be ready */ }
-          }
-          streamUpdate();
-        },
-        onTextDelta: (_delta, fullText) => {
-          fgResponseText = fullText;
-          fgState.responseText = fullText;
-          streamUpdate();
-        },
+        ...fgCallbacks,
       });
 
       clearInterval(spinnerInterval);
@@ -574,32 +590,19 @@ Guidelines:
       }
 
       // Get final token count
-      if (agentSession) {
-        try {
-          tokenText = formatTokens(agentSession.getSessionStats().tokens.total);
-        } catch { /* ignore */ }
-      }
+      const tokenText = safeFormatTokens(fgState.session);
+
+      const details = buildDetails(detailBase, record, { tokens: tokenText });
 
       if (record.status === "error") {
-        return textResult(
-          `Agent failed: ${record.error}`,
-          { ...detailBase, toolUses: record.toolUses, tokens: tokenText, durationMs: (record.completedAt ?? Date.now()) - record.startedAt, status: "error" as const, error: record.error },
-        );
+        return textResult(`Agent failed: ${record.error}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
-      const statusNote = record.status === "aborted"
-        ? " (aborted — max turns exceeded, output may be incomplete)"
-        : record.status === "steered"
-          ? " (wrapped up — reached turn limit)"
-          : record.status === "stopped"
-            ? " (stopped by user)"
-            : "";
-
       return textResult(
-        `Agent completed in ${formatMs(durationMs)} (${record.toolUses} tool uses)${statusNote}.\n\n` +
+        `Agent completed in ${formatMs(durationMs)} (${record.toolUses} tool uses)${getStatusNote(record.status)}.\n\n` +
         (record.result ?? "No output."),
-        { ...detailBase, toolUses: record.toolUses, tokens: tokenText, durationMs, status: record.status, agentId: record.id },
+        details,
       );
     },
   });
@@ -772,10 +775,7 @@ Guidelines:
       }
 
       const duration = formatDuration(record.startedAt, record.completedAt);
-      const statusNote = record.status === "aborted" ? " (aborted — max turns exceeded)"
-        : record.status === "steered" ? " (wrapped up — turn limit)"
-        : record.status === "stopped" ? " (stopped)"
-        : "";
+      const statusNote = getStatusNote(record.status);
 
       // Send the result as a message so it appears in the conversation
       pi.sendMessage(

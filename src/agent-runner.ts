@@ -15,7 +15,7 @@ import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { Model } from "@mariozechner/pi-ai";
 import { getToolsForType, getConfig, getCustomAgentConfig } from "./agent-types.js";
 import { buildSystemPrompt } from "./prompts.js";
-import { buildParentContext } from "./context.js";
+import { buildParentContext, extractText } from "./context.js";
 import { detectEnv } from "./env.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 
@@ -297,14 +297,6 @@ export async function steerAgent(
   message: string,
 ): Promise<void> {
   await session.steer(message);
-}
-
-/** Extract text from a message content block array. */
-function extractText(content: unknown[]): string {
-  return content
-    .filter((c: any) => c.type === "text")
-    .map((c: any) => c.text ?? "")
-    .join("\n");
 }
 
 /**
